@@ -2,12 +2,12 @@ import traceback
 
 import requests
 from aiogram.types import (
-    URLInputFile,
+    InputMediaAnimation,
     InputMediaAudio,
+    InputMediaDocument,
     InputMediaPhoto,
     InputMediaVideo,
-    InputMediaDocument,
-    InputMediaAnimation,
+    URLInputFile,
 )
 
 from logger import logger
@@ -167,8 +167,6 @@ class MediaFetcher:
 
                 if response.status_code == 200:
                     data = response.json()
-                    logger.info(f"Successfully fetched data from {api}")
-                    logger.debug(f"Data: {data}")
                     return MediaResponse.model_validate(data)
 
                 logger.warning(

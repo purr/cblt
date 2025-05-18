@@ -3,7 +3,6 @@ import re
 import time
 import traceback
 import uuid
-from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Union
 
 from aiogram import Bot, F, Router, types
@@ -32,19 +31,20 @@ class BotHandler:
         self.query_info: Dict[str, InlineQueryInfo] = {}
         self.active_messages = {}
 
-        # Timeout settings
+        # Timeout settings - 10 seconds for auto-download
         self.download_timeout = 10  # seconds
         self.timeout_tasks = {}  # To track timeout tasks by query_uuid
 
         self.fetch = MediaFetcher().fetch
 
     async def check_expired_messages_task(self, bot: Bot):
-        """Function to check message expiration and clean up resources"""
+        """Function to check query_info expiration and clean up resources"""
         while True:
             current_time = time.time_ns()
             expired_keys = []
 
-            # Check for expired query_info entries
+            # Check for expired query_info entries - only keeping this for very old entries
+            # Normal expiry is handled by the timeout tasks
             for query_uuid, query_info in self.query_info.items():
                 # If older than 2 minutes, consider it expired
                 if (
@@ -54,21 +54,9 @@ class BotHandler:
 
             # Remove expired messages from tracking
             for key in expired_keys:
-                logger.info(f"Cleaning up expired query_info: {key}")
+                logger.info(f"Cleaning up very old query_info: {key}")
                 await self.cancel_timeout_task(key)
                 self.query_info.pop(key, None)
-
-            # Check for expired active_messages
-            expired_message_keys = []
-            current_datetime = datetime.now()
-            for message_key, expiry_time in self.active_messages.items():
-                if current_datetime > expiry_time:
-                    expired_message_keys.append(message_key)
-
-            # Remove expired active_messages
-            for key in expired_message_keys:
-                logger.info(f"Cleaning up expired active_message: {key}")
-                self.active_messages.pop(key, None)
 
             await asyncio.sleep(5)  # Check every 5 seconds
 
@@ -578,10 +566,6 @@ class BotHandler:
         result_id = chosen_result.result_id  # This should be the query_uuid
 
         if inline_message_id and result_id in self.query_info:
-            # Store inline message with expiration time (20 seconds)
-            message_key = f"inline:{inline_message_id}"
-            self.active_messages[message_key] = datetime.now() + timedelta(seconds=20)
-
             # Create timeout task that will wait and then execute
             async def delayed_auto_download():
                 await asyncio.sleep(self.download_timeout)
@@ -599,7 +583,7 @@ class BotHandler:
             self.timeout_tasks[result_id] = timeout_task
 
             logger.info(
-                f"Tracking inline message {inline_message_id}, will expire in 20 seconds. Auto-download in {self.download_timeout} seconds if no interaction."
+                f"Tracking inline message {inline_message_id}. Auto-download in {self.download_timeout} seconds if no interaction."
             )
 
     async def handle_incoming_message(self, message: types.Message, bot: Bot):

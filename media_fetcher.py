@@ -187,13 +187,13 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
 
                 if response.url:
                     if response.status != "tunnel":
-                        if not await check_url_has_content(response.audio):
+                        if not await check_url_has_content(response.url):
                             result.error_count = 1
                             result.success = False
-                        result.error_message = (
-                            "Failed to download, file appears to be empty"
-                        )
-                        return result
+                            result.error_message = (
+                                "Failed to download, file appears to be empty"
+                            )
+                            return result
 
                     filename = response.filename or "file"
                     input_file = URLInputFile(response.url, filename=filename)

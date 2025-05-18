@@ -12,9 +12,9 @@ from aiogram.types import InlineQueryResultCachedPhoto, InputMedia
 from keyboards import (
     get_download_keyboard,
     get_open_bot_keyboard,
+    get_permission_required_keyboard,
     get_processing_keyboard,
     get_query_keyboard,
-    get_unopened_dms_keyboard,
 )
 from logger import logger
 from media_fetcher import MediaFetcher, parse_media_response
@@ -29,6 +29,8 @@ class BotHandler:
         self.download_image_file_id = "AgACAgQAAyEGAASdI2ANAAMCaB8gSXN6qtwdsZDHpb4clsRPOa8AAgi5MRu85P1Q8JJsMOZm9k0BAAMCAAN3AAM2BA"
 
         self.query_info: Dict[str, InlineQueryInfo] = {}
+        self.query_timestamps = []  # List of UUIDs in chronological order (oldest first)
+        self.MAX_QUERIES = 100  # Maximum number of queries to keep in memory
         self.active_messages = {}
 
         # Timeout settings - 10 seconds for auto-download
@@ -37,28 +39,62 @@ class BotHandler:
 
         self.fetch = MediaFetcher().fetch
 
+    async def add_query(self, query_uuid: str, query_info: InlineQueryInfo) -> None:
+        """Add a query to the tracking system, removing oldest if at capacity"""
+        # Add the new query
+        self.query_info[query_uuid] = query_info
+        self.query_timestamps.append(query_uuid)
+
+        # If we're over capacity, remove the oldest
+        while len(self.query_timestamps) > self.MAX_QUERIES:
+            oldest_uuid = self.query_timestamps.pop(0)  # Remove and get oldest UUID
+            if oldest_uuid in self.query_info:
+                await self.cancel_timeout_task(oldest_uuid)
+                del self.query_info[oldest_uuid]
+                logger.info(
+                    f"Removed oldest query {oldest_uuid} to maintain size limit"
+                )
+
+    async def remove_query(self, query_uuid: str) -> None:
+        """Remove a query from the tracking system"""
+        if query_uuid in self.query_info:
+            del self.query_info[query_uuid]
+
+        # Also remove from timestamps list
+        if query_uuid in self.query_timestamps:
+            self.query_timestamps.remove(query_uuid)
+
     async def check_expired_messages_task(self, bot: Bot):
-        """Function to check query_info expiration and clean up resources"""
+        """Function to periodically log query stats and verify consistency"""
         while True:
-            current_time = time.time_ns()
-            expired_keys = []
+            try:
+                # Just log stats periodically
+                total_entries = len(self.query_info)
+                if total_entries > 0:
+                    logger.debug(
+                        f"Currently tracking {total_entries} queries in memory"
+                    )
 
-            # Check for expired query_info entries - only keeping this for very old entries
-            # Normal expiry is handled by the timeout tasks
-            for query_uuid, query_info in self.query_info.items():
-                # If older than 2 minutes, consider it expired
-                if (
-                    current_time - query_info.time_ns
-                ) > 120 * 1_000_000_000:  # 2 minutes in ns
-                    expired_keys.append(query_uuid)
+                # Verify consistency between query_info and query_timestamps (just in case)
+                if len(self.query_info) != len(self.query_timestamps):
+                    logger.warning(
+                        f"Query tracking inconsistency: {len(self.query_info)} items in query_info but {len(self.query_timestamps)} in timestamps"
+                    )
 
-            # Remove expired messages from tracking
-            for key in expired_keys:
-                logger.info(f"Cleaning up very old query_info: {key}")
-                await self.cancel_timeout_task(key)
-                self.query_info.pop(key, None)
+                    # Fix any inconsistency by rebuilding timestamps from query_info
+                    for uuid_key in list(self.query_timestamps):
+                        if uuid_key not in self.query_info:
+                            self.query_timestamps.remove(uuid_key)
 
-            await asyncio.sleep(5)  # Check every 5 seconds
+                    for uuid_key in self.query_info.keys():
+                        if uuid_key not in self.query_timestamps:
+                            self.query_timestamps.append(uuid_key)
+
+            except Exception as e:
+                logger.error(f"Error in query tracking monitor: {e}")
+
+            # Check much less frequently since this is just for monitoring now
+            await asyncio.sleep(60)  # Check once a minute
 
     async def register_handlers(self):
         """Register all handlers with the router"""
@@ -68,6 +104,16 @@ class BotHandler:
         router.message.register(self.cmd_start, Command("start"))
         router.callback_query.register(
             self.process_callback, F.data.startswith("download:")
+        )
+
+        # Add handler for permission_info button
+        router.callback_query.register(
+            self.process_permission_info, F.data == "permission_info"
+        )
+
+        # Add handler for try_again button
+        router.callback_query.register(
+            self.process_try_again_callback, F.data.startswith("try_again:")
         )
 
         # We need to customize this handler to pass the bot
@@ -102,7 +148,7 @@ class BotHandler:
 
             # Remove query info after processing to avoid reuse
             if download_uuid in self.query_info:
-                del self.query_info[download_uuid]
+                await self.remove_query(download_uuid)
 
         except Exception as e:
             logger.error(f"Error processing callback: {e}")
@@ -118,6 +164,58 @@ class BotHandler:
 
         if start_param and start_param.startswith("help"):
             return
+
+        # Check if this is a download deep link
+        if start_param and start_param.startswith("download_"):
+            try:
+                # Parse download_uuid and download_type from the deep link parameter
+                # Format: "download_UUID_TYPE"
+                parts = start_param.split("_")
+                if len(parts) >= 3:
+                    download_uuid = parts[1]
+                    download_type = parts[2]
+
+                    # Check if this download still exists in our tracking
+                    if download_uuid in self.query_info:
+                        logger.info(
+                            f"Auto-triggering download from /start deep link: {download_uuid} ({download_type})"
+                        )
+
+                        # Let the user know we're handling their request
+                        await message.answer(
+                            "✨ I'll try to download that media for you now! ✨",
+                            disable_notification=True,
+                        )
+
+                        # Create a callback query to simulate a download button press
+                        callback = types.CallbackQuery(
+                            id=str(uuid.uuid4()),
+                            from_user=message.from_user,
+                            chat_instance=str(uuid.uuid4()),
+                            message=None,
+                            data=f"download:{download_uuid}:{download_type}",
+                        )
+
+                        # If this is from an inline query, we need to simulate an inline message
+                        if self.query_info[download_uuid].inline:
+                            # For inline queries, we'll need to get the user to click the button again
+                            await message.answer(
+                                "🔄 Please go back to the chat where you used the bot and click the 'Try Again' button.",
+                                disable_notification=True,
+                            )
+                        else:
+                            # For direct messages, we can simulate the callback directly
+                            # Process the callback (this will send the media)
+                            await self.process_callback(callback, bot)
+                            return
+                    else:
+                        logger.info(
+                            f"Download from deep link failed - UUID not found: {download_uuid}"
+                        )
+                        # Just show the welcome message
+            except Exception as e:
+                logger.error(f"Error processing download deep link: {e}")
+                # Fall through to normal welcome message
 
         text = (
             f"👋 Welcome to the bot @{bot_info.username}!\n\n"
@@ -224,6 +322,14 @@ class BotHandler:
         except Exception as e:
             traceback.print_exc()
             logger.error(f"Error sending media to user {user_id}: {e}")
+
+            # Check if it's a permission error (user blocked bot or didn't start it)
+            if "Forbidden: bot was blocked by the user" in str(
+                e
+            ) or "bot can't initiate conversation" in str(e):
+                logger.warning(f"User {user_id} has not started the bot or blocked it")
+                return False, None
+
             return False, None
 
     async def process_download_callback(
@@ -250,32 +356,60 @@ class BotHandler:
         if callback.from_user.id != from_user_id:
             return await callback.answer("𖦹 This is not your message ₊✧⋆⭒˚｡⋆")
 
-        # For inline queries, check if we can send DMs
-        if is_inline:
-            try:
-                # Test if we can send DM to the user
-                message = await bot.send_message(
-                    callback.from_user.id, "(｡•̀ᴗ-)✧", disable_notification=True
-                )
-                await bot.delete_message(callback.from_user.id, message.message_id)
-
-            except Exception as e:
-                try:
-                    logger.error(f"Failed to send and delete dummy message: {e}")
-                    await callback.answer(
-                        "Start the bot and retry",
-                        show_alert=True,
-                    )
-                    return await bot.edit_message_reply_markup(
-                        inline_message_id=callback.inline_message_id,
-                        reply_markup=await get_unopened_dms_keyboard(
-                            download_uuid, url, self.bot_username
-                        ),
-                    )
-                except Exception:
-                    pass
-
         try:
+            # Cancel the timeout task if it exists (this wasn't previously done for automatic downloads)
+            if not automatic_download:
+                await self.cancel_timeout_task(download_uuid)
+
+            logger.info(
+                f"Processing {'auto' if automatic_download else 'user-initiated'} callback for {download_uuid}"
+            )
+
+            # For inline queries, check if we can send DMs
+            if is_inline:
+                try:
+                    # Test if we can send DM to the user
+                    message = await bot.send_message(
+                        callback.from_user.id, "(｡•̀ᴗ-)✧", disable_notification=True
+                    )
+                    await bot.delete_message(callback.from_user.id, message.message_id)
+
+                except Exception as e:
+                    try:
+                        logger.error(f"Failed to send and delete dummy message: {e}")
+
+                        # Cancel the timeout task for this download since it won't work
+                        await self.cancel_timeout_task(download_uuid)
+
+                        # Update the message with the permission required keyboard
+                        await bot.edit_message_reply_markup(
+                            inline_message_id=callback.inline_message_id,
+                            reply_markup=await get_permission_required_keyboard(
+                                url, self.bot_username, download_uuid
+                            ),
+                        )
+
+                        # Clean up query_info since we won't proceed with download
+                        if download_uuid in self.query_info:
+                            await self.remove_query(download_uuid)
+                            logger.debug(
+                                f"Cleaned up query_info for {download_uuid} after permission error"
+                            )
+                        try:
+                            await callback.answer(
+                                "Start the bot and try again",
+                                show_alert=True,
+                            )
+                        except Exception:
+                            pass
+
+                        return False
+                    except Exception as reply_error:
+                        logger.error(
+                            f"Failed to send permission required message: {reply_error}"
+                        )
+                        return False
+
             processing_keyboard = await get_processing_keyboard(url)
             if is_inline:
                 await bot.edit_message_reply_markup(
@@ -299,6 +433,16 @@ class BotHandler:
             logger.debug(f"Response: {response}")
 
             result = await parse_media_response(response)
+
+            # Clean up query_info as soon as we've fetched and processed the response
+            # This ensures we don't leave entries in memory unnecessarily
+            query_info_cleaned = False
+            if download_uuid in self.query_info:
+                await self.remove_query(download_uuid)
+                query_info_cleaned = True
+                logger.debug(
+                    f"Cleaned up query_info for {download_uuid} after processing"
+                )
 
             # Handle error case
             if not result.success:
@@ -328,6 +472,27 @@ class BotHandler:
                     user.id, media_list, bot, query_keyboard
                 )
 
+                # If we couldn't send the DM (perhaps user hasn't started the bot)
+                if not dm_sent:
+                    if is_inline:
+                        # For inline messages, show a permission required message
+                        await bot.edit_message_reply_markup(
+                            inline_message_id=callback.inline_message_id,
+                            reply_markup=await get_permission_required_keyboard(
+                                url, self.bot_username, download_uuid
+                            ),
+                        )
+                    else:
+                        # For direct messages, show a permission required message
+                        await bot.edit_message_reply_markup(
+                            chat_id=callback.message.chat.id,
+                            message_id=callback.message.message_id,
+                            reply_markup=await get_permission_required_keyboard(
+                                url, self.bot_username, download_uuid
+                            ),
+                        )
+                    return True
+
                 # Number of media files for the success message
                 media_count = result.success_count
                 is_multi_media = media_count > 1
@@ -348,6 +513,8 @@ class BotHandler:
                     error_count=result.error_count,
                     total_count=result.total_count,
                 )
+
+            return True
 
         except Exception as e:
             traceback.print_exc()
@@ -373,11 +540,18 @@ class BotHandler:
             except Exception as fallback_error:
                 logger.error(f"Failed to send fallback message: {fallback_error}")
 
-            await callback.answer("Failed to process media. Please try again.")
+            # Make sure to clean up query_info even on error
+            if download_uuid in self.query_info and not query_info_cleaned:
+                await self.remove_query(download_uuid)
+                logger.debug(f"Cleaned up query_info for {download_uuid} after error")
 
-        if not automatic_download:
-            await callback.answer()
-            logger.info(f"Callback processed: {download_type} by user {user.id}")
+            await callback.answer("Failed to process media. Please try again.")
+            return False
+
+        finally:
+            if not automatic_download:
+                await callback.answer()
+                logger.info(f"Callback processed: {download_type} by user {user.id}")
 
     async def update_original_message(
         self,
@@ -532,12 +706,14 @@ class BotHandler:
         url = match.group(0)
 
         query_uuid = str(uuid.uuid4())
-        self.query_info[query_uuid] = InlineQueryInfo(
+        query_info = InlineQueryInfo(
             query=url,
             inline=True,
             time_ns=time.time_ns(),
             from_user_id=inline_query.from_user.id,
         )
+        await self.add_query(query_uuid, query_info)
+
         photo = InlineQueryResultCachedPhoto(
             id=query_uuid,
             photo_file_id=self.download_image_file_id,
@@ -612,12 +788,13 @@ class BotHandler:
             query_uuid = str(uuid.uuid4())
 
             # Store query info similar to inline queries
-            self.query_info[query_uuid] = InlineQueryInfo(
+            query_info = InlineQueryInfo(
                 query=url,
                 inline=False,  # This is a direct message, not inline
                 time_ns=time.time_ns(),
                 from_user_id=message.from_user.id,
             )
+            await self.add_query(query_uuid, query_info)
 
             # Send the same download image with buttons as used in inline queries
             sent_message = await bot.send_photo(
@@ -680,27 +857,19 @@ class BotHandler:
             # Get stored information
             user_id = self.query_info[query_uuid].from_user_id
 
-            # Instead of creating a mock callback, let's directly call process_download_callback
+            # Create the appropriate callback query object
             if is_inline:
                 # For inline messages
                 logger.info(
                     f"Auto-triggering download for inline message {inline_message_id}"
                 )
-                await self.process_download_callback(
-                    callback=types.CallbackQuery(
-                        id=str(uuid.uuid4()),
-                        from_user=types.User(
-                            id=user_id, is_bot=False, first_name="User"
-                        ),
-                        chat_instance=str(uuid.uuid4()),
-                        message=None,
-                        data=f"download:{query_uuid}:auto",
-                        inline_message_id=inline_message_id,
-                    ),
-                    bot=bot,
-                    download_uuid=query_uuid,
-                    download_type="auto",
-                    automatic_download=True,
+                callback = types.CallbackQuery(
+                    id=str(uuid.uuid4()),
+                    from_user=types.User(id=user_id, is_bot=False, first_name="User"),
+                    chat_instance=str(uuid.uuid4()),
+                    message=None,
+                    data=f"download:{query_uuid}:auto",
+                    inline_message_id=inline_message_id,
                 )
             else:
                 # For direct messages
@@ -708,6 +877,8 @@ class BotHandler:
                     logger.error(
                         "Missing message_id or chat_id for direct message timeout"
                     )
+                    # Clean up query_info anyway to avoid memory leaks
+                    await self.remove_query(query_uuid)
                     return
 
                 logger.info(
@@ -724,35 +895,40 @@ class BotHandler:
                             id=user_id, is_bot=False, first_name="User"
                         ),
                     )
-
-                    await self.process_download_callback(
-                        callback=types.CallbackQuery(
-                            id=str(uuid.uuid4()),
-                            from_user=types.User(
-                                id=user_id, is_bot=False, first_name="User"
-                            ),
-                            chat_instance=str(uuid.uuid4()),
-                            message=message,
-                            data=f"download:{query_uuid}:auto",
+                    callback = types.CallbackQuery(
+                        id=str(uuid.uuid4()),
+                        from_user=types.User(
+                            id=user_id, is_bot=False, first_name="User"
                         ),
-                        bot=bot,
-                        download_uuid=query_uuid,
-                        download_type="auto",
-                        automatic_download=True,
+                        chat_instance=str(uuid.uuid4()),
+                        message=message,
+                        data=f"download:{query_uuid}:auto",
                     )
                 except Exception as chat_error:
                     logger.error(f"Failed to get chat for timeout: {chat_error}")
+                    # Clean up query_info in case of error
+                    await self.remove_query(query_uuid)
+                    return
 
-            # Clean up after execution to avoid double processing
-            await self.cancel_timeout_task(query_uuid)
-            if query_uuid in self.query_info:
-                del self.query_info[query_uuid]
+            # Call process_download_callback with the auto-download flag
+            await self.process_download_callback(
+                callback=callback,
+                bot=bot,
+                download_uuid=query_uuid,
+                download_type="auto",
+                automatic_download=True,
+            )
+
+            # Note: query_info for this download_uuid is now cleaned up by process_download_callback
 
         except Exception as e:
             traceback.print_exc()
             logger.error(f"Error in handle_timeout: {e}")
             # Attempt to clean up resources even on error
             await self.cancel_timeout_task(query_uuid)
+            # Clean up query_info on error to prevent memory leaks
+            if query_uuid in self.query_info:
+                await self.remove_query(query_uuid)
 
     async def cancel_timeout_task(self, query_uuid: str):
         """Cancel a timeout task and remove it from tracking"""
@@ -764,3 +940,37 @@ class BotHandler:
                 logger.error(f"Error cancelling timeout task: {e}")
             finally:
                 self.timeout_tasks.pop(query_uuid, None)
+
+    async def process_permission_info(self, callback: types.CallbackQuery, bot: Bot):
+        """Handler for permission_info button callbacks"""
+        await callback.answer(
+            "The bot needs permission to send you messages. Please start the bot by pressing the /start button.",
+            show_alert=True,
+        )
+
+    async def process_try_again_callback(self, callback: types.CallbackQuery, bot: Bot):
+        """Process try_again button callbacks by simulating a regular download callback"""
+        try:
+            # Parse the callback data
+            callback_parts = callback.data.split(":")
+            if len(callback_parts) < 3:
+                return await callback.answer("Invalid callback format", show_alert=True)
+
+            uuid = callback_parts[1]
+            download_type = callback_parts[2]  # 'auto' or 'audio'
+
+            # Create a mock callback that looks like a download callback
+            mock_data = f"download:{uuid}:{download_type}"
+            callback.data = mock_data
+
+            # Answer the callback first
+            await callback.answer(f"Trying {download_type} download again...")
+
+            # Process it like a regular download callback
+            await self.process_callback(callback, bot)
+
+        except Exception as e:
+            logger.error(f"Error in process_try_again_callback: {e}")
+            await callback.answer(
+                "Failed to retry download. Please try again later.", show_alert=True
+            )

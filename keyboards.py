@@ -17,9 +17,18 @@ async def audio_btn(uuid: str):
     )
 
 
-async def start_bot_btn(bot_username: str):
+async def start_bot_btn(bot_username: str, uuid: str = None, download_type: str = None):
+    """Create a button to start the bot
+
+    If uuid and download_type are provided, it will create a deep link that
+    will automatically attempt to download after starting
+    """
+    start_param = "from_inline"
+    if uuid and download_type:
+        start_param = f"download_{uuid}_{download_type}"
+
     return InlineKeyboardButton(
-        text="ﾟ+..｡*ﾟ+ /start", url=f"https://t.me/{bot_username}?start=from_inline"
+        text="ﾟ+..｡*ﾟ+ /start", url=f"https://t.me/{bot_username}?start={start_param}"
     )
 
 
@@ -50,6 +59,42 @@ async def get_unopened_dms_keyboard(uuid: str, url: str, bot_username: str):
             [await start_bot_btn(bot_username)],
         ]
     )
+
+
+async def get_permission_required_keyboard(
+    url: str, bot_username: str, uuid: str = None
+):
+    """Function to create keyboard for the permission required scenario
+
+    If uuid is provided, adds Try Again buttons that will simulate real callbacks
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                text="⚠️ Permission Required", callback_data="permission_info"
+            )
+        ],
+        [
+            await start_bot_btn(bot_username, uuid, "auto")
+        ],  # Default to auto download on start
+        [await query_btn(url)],
+    ]
+
+    # If we have a uuid, add Try Again buttons that will work after the user starts the bot
+    if uuid:
+        keyboard.insert(
+            1,
+            [
+                InlineKeyboardButton(
+                    text="🔄 Try Again (Auto)", callback_data=f"try_again:{uuid}:auto"
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Try Again (Audio)", callback_data=f"try_again:{uuid}:audio"
+                ),
+            ],
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 async def get_open_bot_keyboard(bot_username: str):

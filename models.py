@@ -1,6 +1,7 @@
 from typing import List, Literal, Optional
 from urllib.parse import urlparse
 
+from aiogram.types import InputMedia
 from pydantic import BaseModel, model_validator
 
 
@@ -95,3 +96,33 @@ class MediaResponse(BaseModel):
                     self.filename = "file"
 
         return self
+
+
+class ParsedMediaResponse(BaseModel):
+    """
+    Model for the parsed media response, ready to be sent to Telegram
+    """
+
+    # Media items to be sent to Telegram
+    media_items: List[InputMedia] = []
+
+    # Error information
+    success: bool = True  # True if at least one item succeeded
+    error_message: Optional[str] = None
+    error_count: int = 0
+    total_count: int = 0
+
+    @property
+    def success_count(self) -> int:
+        """Number of successfully processed items"""
+        return len(self.media_items)
+
+    @property
+    def has_errors(self) -> bool:
+        """Whether there were any errors during processing"""
+        return self.error_count > 0
+
+    @property
+    def all_failed(self) -> bool:
+        """Whether all items failed to process"""
+        return self.total_count > 0 and self.success_count == 0

@@ -1,32 +1,31 @@
+import asyncio
 import re
 import time
-import uuid
-import asyncio
 import traceback
-from typing import Dict, List, Tuple, Union
+import uuid
 from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Union
 
-from aiogram import F, Bot, Router, types
-from aiogram.types import InputMedia, InlineQueryResultCachedPhoto
+from aiogram import Bot, F, Router, types
 from aiogram.filters import Command
+from aiogram.types import InlineQueryResultCachedPhoto, InputMedia
 
-from logger import logger
-from models import InlineQueryInfo
 from keyboards import (
-    get_query_keyboard,
     get_download_keyboard,
     get_open_bot_keyboard,
     get_processing_keyboard,
+    get_query_keyboard,
     get_unopened_dms_keyboard,
 )
+from logger import logger
 from media_fetcher import MediaFetcher, parse_media_response
+from models import InlineQueryInfo
 
 router = Router()
 
 
 class BotHandler:
     def __init__(self):
-
         self.bot_username = None
         self.download_image_file_id = "AgACAgQAAyEGAASdI2ANAAMCaB8gSXN6qtwdsZDHpb4clsRPOa8AAgi5MRu85P1Q8JJsMOZm9k0BAAMCAAN3AAM2BA"
 
@@ -314,8 +313,8 @@ class BotHandler:
             result = await parse_media_response(response)
 
             # Handle error case
-            if isinstance(result, str):
-                error_message = f"Error: {result}"
+            if not result.success:
+                error_message = f"⚠️ Error: {result.error_message}"
                 if is_inline:
                     await bot.edit_message_text(
                         inline_message_id=callback.inline_message_id,
@@ -329,9 +328,11 @@ class BotHandler:
                         caption=error_message,
                         reply_markup=query_keyboard,
                     )
+            elif result.success:
+                media_list = result.media_items
 
-            elif result is not None:
-                media_list = result if isinstance(result, list) else [result]
+                # Check if we had partial success (some items failed)
+                partial_success = result.has_errors and result.success_count > 0
 
                 # Send media to DM regardless of whether it's inline or not
                 # Pass the query keyboard to attach it to the media in DMs
@@ -340,7 +341,7 @@ class BotHandler:
                 )
 
                 # Number of media files for the success message
-                media_count = len(media_list)
+                media_count = result.success_count
                 is_multi_media = media_count > 1
 
                 # Update the original message with the first media (where possible)
@@ -355,6 +356,9 @@ class BotHandler:
                     dm_sent=dm_sent,
                     query_keyboard=query_keyboard,
                     open_bot_keyboard=open_bot_keyboard,
+                    partial_success=partial_success,
+                    error_count=result.error_count,
+                    total_count=result.total_count,
                 )
 
         except Exception as e:
@@ -399,6 +403,9 @@ class BotHandler:
         dm_sent: bool,
         query_keyboard,
         open_bot_keyboard,
+        partial_success: bool = False,
+        error_count: int = 0,
+        total_count: int = 0,
     ):
         """Helper function to update the original message with media or status"""
         try:
@@ -419,9 +426,17 @@ class BotHandler:
 
                         # Add caption for multiple media files
                         if is_multi_media and dm_sent:
+                            caption_text = (
+                                f"Found {media_count} media, sent the rest via DM"
+                            )
+                            if partial_success:
+                                caption_text += (
+                                    f" ({error_count} of {total_count} failed)"
+                                )
+
                             await bot.edit_message_caption(
                                 inline_message_id=callback.inline_message_id,
-                                caption=f"Found {media_count} media, sent the rest via DM",
+                                caption=caption_text,
                                 reply_markup=open_bot_keyboard,
                             )
                     except Exception as e:
@@ -432,6 +447,10 @@ class BotHandler:
                             if is_multi_media
                             else "Media sent to your DM"
                         )
+
+                        if partial_success:
+                            success_msg += f" ({error_count} of {total_count} failed)"
+
                         await bot.edit_message_text(
                             inline_message_id=callback.inline_message_id,
                             text=(
@@ -452,9 +471,15 @@ class BotHandler:
                         )
 
                         if media_count > 1:
+                            message_text = f"{media_count} media files"
+                            if partial_success:
+                                message_text += (
+                                    f" ({error_count} of {total_count} failed)"
+                                )
+
                             await bot.send_message(
                                 chat_id=callback.message.chat.id,
-                                text=f"{media_count} media files",
+                                text=message_text,
                                 reply_markup=query_keyboard,
                                 disable_notification=True,
                             )
@@ -697,7 +722,7 @@ class BotHandler:
                 # For direct messages
                 if not message_id or not chat_id:
                     logger.error(
-                        f"Missing message_id or chat_id for direct message timeout"
+                        "Missing message_id or chat_id for direct message timeout"
                     )
                     return
 

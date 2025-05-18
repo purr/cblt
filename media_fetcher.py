@@ -1,5 +1,8 @@
+import asyncio
 import traceback
+from functools import lru_cache
 
+import aiohttp
 import requests
 from aiogram.types import (
     InputMediaAnimation,
@@ -14,9 +17,17 @@ from logger import logger
 from models import MediaResponse, ParsedMediaResponse
 
 
+# Cache successful URL content checks to avoid redundant requests
+@lru_cache(maxsize=100)
+def _cache_url_has_content(url: str) -> bool:
+    """Cache wrapper for URL content checks - only caches positive results"""
+    return True
+
+
 async def check_url_has_content(url: str) -> bool:
     """
     Check if a URL has at least 1 bit of content without downloading the entire file.
+    Uses async HTTP requests and caching for faster performance.
 
     Args:
         url: The URL to check
@@ -24,36 +35,46 @@ async def check_url_has_content(url: str) -> bool:
     Returns:
         bool: True if the URL has content, False otherwise
     """
+
+    if _cache_url_has_content.cache_info()[0] > 0 and _cache_url_has_content(url):
+        return True
+
     try:
-        # Make a HEAD request to get headers without downloading content
-        response = requests.head(url, timeout=5)
+        timeout = aiohttp.ClientTimeout(total=3)
 
-        # Check if the server supports HEAD requests
-        if response.status_code < 400:
-            # Check Content-Length header
-            content_length = response.headers.get("Content-Length")
-            if content_length and int(content_length) > 0:
-                logger.info(
-                    f"URL has content: {url} (Content-Length: {content_length})"
-                )
-                return True
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.head(url) as response:
+                    if response.status < 400:
+                        content_length = response.headers.get("Content-Length")
+                        if content_length and int(content_length) > 0:
+                            logger.info(
+                                f"URL has content: {url} (Content-Length: {content_length})"
+                            )
+                            return _cache_url_has_content(url)
 
-        # If HEAD request fails or doesn't have Content-Length, try a GET with Range header
-        response = requests.get(
-            url,
-            headers={"Range": "bytes=0-0"},  # Request just the first byte
-            timeout=5,
-        )
+            except asyncio.TimeoutError:
+                logger.warning(f"HEAD request timeout for {url}")
+            except Exception as e:
+                logger.warning(f"HEAD request failed for {url}: {e}")
 
-        if response.status_code // 100 in (2, 3):  # Check if it starts with 2 or 3
-            if len(response.content) > 0:
-                logger.info(f"URL has content: {url}")
-                return True
+            try:
+                headers = {"Range": "bytes=0-0"}
+                async with session.get(url, headers=headers) as response:
+                    if response.status // 100 in (2, 3):
+                        content = await response.read()
+                        if len(content) > 0:
+                            logger.info(f"URL has content: {url}")
+                            return _cache_url_has_content(url)
+            except asyncio.TimeoutError:
+                logger.warning(f"GET request timeout for {url}")
+            except Exception as e:
+                logger.warning(f"GET request failed for {url}: {e}")
+
         logger.warning(f"URL appears to be empty: {url}")
         return False
     except Exception as e:
         logger.warning(f"Error checking URL content: {e}")
-        # If we can't check, assume it has content
         return True
 
 
@@ -85,24 +106,33 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
         if response.status == "picker" and response.picker:
             result.total_count = len(response.picker)
 
+            check_tasks = []
+            for item in response.picker:
+                check_tasks.append(check_url_has_content(item.url))
+                if item.thumb:
+                    check_tasks.append(check_url_has_content(item.thumb))
+                else:
+                    check_tasks.append(asyncio.sleep(0))
+
+            check_results = await asyncio.gather(*check_tasks)
+
             for index, item in enumerate(response.picker):
                 try:
-                    # Check if URL has content
-                    if not await check_url_has_content(item.url):
+                    url_has_content = check_results[index * 2]
+                    thumb_has_content = (
+                        check_results[index * 2 + 1] if item.thumb else False
+                    )
+
+                    if not url_has_content:
                         result.error_count += 1
                         logger.warning(f"Picker item {index + 1} has empty content")
                         continue
 
                     input_file = URLInputFile(item.url)
                     thumbnail = None
-                    if item.thumb:
+                    if item.thumb and thumb_has_content:
                         try:
-                            if await check_url_has_content(item.thumb):
-                                thumbnail = URLInputFile(item.thumb)
-                            else:
-                                logger.warning(
-                                    f"Thumbnail for item {index + 1} is empty, skipping thumbnail"
-                                )
+                            thumbnail = URLInputFile(item.thumb)
                         except Exception as thumb_error:
                             logger.warning(f"Failed to create thumbnail: {thumb_error}")
 
@@ -138,10 +168,10 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
 
             try:
                 if response.audio:
-                    # Check if audio URL has content
-                    if not await check_url_has_content(response.audio):
-                        result.error_count = 1
-                        result.success = False
+                    if response.status != "tunnel":
+                        if not await check_url_has_content(response.audio):
+                            result.error_count = 1
+                            result.success = False
                         result.error_message = (
                             "Failed to download, audio appears to be empty"
                         )
@@ -156,10 +186,10 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                     return result
 
                 if response.url:
-                    # Check if URL has content
-                    if not await check_url_has_content(response.url):
-                        result.error_count = 1
-                        result.success = False
+                    if response.status != "tunnel":
+                        if not await check_url_has_content(response.audio):
+                            result.error_count = 1
+                            result.success = False
                         result.error_message = (
                             "Failed to download, file appears to be empty"
                         )
@@ -168,7 +198,6 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                     filename = response.filename or "file"
                     input_file = URLInputFile(response.url, filename=filename)
 
-                    # Use the type field from MediaResponse instead of checking filename extensions
                     if response.type == "video":
                         logger.info("Creating video object based on type")
                         media = InputMediaVideo(media=input_file)

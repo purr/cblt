@@ -20,6 +20,10 @@ from models import MediaResponse, ParsedMediaResponse
 
 # Cache successful URL content checks to avoid redundant requests
 _url_content_lock = Lock()
+headers = {
+    "Accept": "*/*",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
+}
 
 
 async def fix_url(url, status):
@@ -81,6 +85,11 @@ async def check_url_has_content(url: str) -> bool:
         return False
 
 
+class CustomURLInputFile(URLInputFile):
+    def __init__(self, *args, timeout=40, headers=headers, **kwargs):
+        super().__init__(*args, timeout=timeout, headers=headers, **kwargs)
+
+
 async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
     """Parse the media response and return a structured ParsedMediaResponse
 
@@ -131,11 +140,13 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                         logger.warning(f"Picker item {index + 1} has empty content")
                         continue
 
-                    input_file = URLInputFile(await fix_url(item.url, response.status))
+                    input_file = CustomURLInputFile(
+                        await fix_url(item.url, response.status)
+                    )
                     thumbnail = None
                     if item.thumb and thumb_has_content:
                         try:
-                            thumbnail = URLInputFile(
+                            thumbnail = CustomURLInputFile(
                                 await fix_url(item.thumb, response.status)
                             )
                         except Exception as thumb_error:
@@ -182,7 +193,7 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                         )
                         return result
 
-                    input_file = URLInputFile(
+                    input_file = CustomURLInputFile(
                         await fix_url(response.audio, response.status),
                         filename=response.audioFilename or "audio.mp3",
                     )
@@ -201,7 +212,7 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                             return result
 
                     filename = response.filename or "file"
-                    input_file = URLInputFile(
+                    input_file = CustomURLInputFile(
                         await fix_url(response.url, response.status),
                         filename=filename,
                     )

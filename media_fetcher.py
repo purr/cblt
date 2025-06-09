@@ -1,8 +1,9 @@
 import asyncio
 import traceback
 from functools import lru_cache
+from threading import Lock
 
-import aiohttp
+import httpx
 import requests
 from aiogram.types import (
     InputMediaAnimation,
@@ -12,70 +13,72 @@ from aiogram.types import (
     InputMediaVideo,
     URLInputFile,
 )
+from yarl import URL
 
 from logger import logger
 from models import MediaResponse, ParsedMediaResponse
 
-
 # Cache successful URL content checks to avoid redundant requests
+_url_content_lock = Lock()
+
+
+async def fix_url(url, status):
+    #     if status == "redirect":
+    #         for _ in range(3):
+    #             payload = {"url": url, "alias": "", "password": "", "max-clicks": ""}
+    #             response = httpx.post(
+    #                 "https://spoo.me/", json=payload, follow_redirects=True
+    #             )
+    #             if response.is_redirect:
+    #                 return response.url.replace("result/", "")
+
+    return URL(url, encoded=True)
+
+
 @lru_cache(maxsize=100)
-def _cache_url_has_content(url: str) -> bool:
-    """Cache wrapper for URL content checks - only caches positive results"""
-    return True
+def _sync_url_has_content(url: str) -> bool:
+    """Synchronous helper to check if a URL has content, with caching for positive results only."""
+    try:
+        resp = requests.head(url, timeout=5, allow_redirects=True)
+        if resp.status_code == 200 and int(resp.headers.get("Content-Length", 0)) > 22:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 async def check_url_has_content(url: str) -> bool:
     """
     Check if a URL has at least 1 bit of content without downloading the entire file.
     Uses async HTTP requests and caching for faster performance.
-
-    Args:
-        url: The URL to check
-
-    Returns:
-        bool: True if the URL has content, False otherwise
     """
-
-    if _cache_url_has_content.cache_info()[0] > 0 and _cache_url_has_content(url):
-        return True
-
+    # Use the synchronous cache in a thread-safe way
     try:
-        timeout = aiohttp.ClientTimeout(total=3)
+        # Use a lock to avoid race conditions in the cache
+        with _url_content_lock:
+            cached = _sync_url_has_content(url)
+        if cached:
+            logger.info(f"URL found in cache: {url}")
+            return True
+    except Exception:
+        pass
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            try:
-                async with session.head(url) as response:
-                    if response.status < 400:
-                        content_length = response.headers.get("Content-Length")
-                        if content_length and int(content_length) > 0:
-                            logger.info(
-                                f"URL has content: {url} (Content-Length: {content_length})"
-                            )
-                            return _cache_url_has_content(url)
-
-            except asyncio.TimeoutError:
-                logger.warning(f"HEAD request timeout for {url}")
-            except Exception as e:
-                logger.warning(f"HEAD request failed for {url}: {e}")
-
-            try:
-                headers = {"Range": "bytes=0-0"}
-                async with session.get(url, headers=headers) as response:
-                    if response.status // 100 in (2, 3):
-                        content = await response.read()
-                        if len(content) > 0:
-                            logger.info(f"URL has content: {url}")
-                            return _cache_url_has_content(url)
-            except asyncio.TimeoutError:
-                logger.warning(f"GET request timeout for {url}")
-            except Exception as e:
-                logger.warning(f"GET request failed for {url}: {e}")
-
-        logger.warning(f"URL appears to be empty: {url}")
-        return False
+    # If not cached, check asynchronously and update cache if positive
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.head(url, timeout=5)
+            if (
+                resp.status_code == 200
+                and int(resp.headers.get("Content-Length", 0)) > 22
+            ):
+                # Store positive result in cache
+                with _url_content_lock:
+                    _sync_url_has_content(url)
+                return True
+            return False
     except Exception as e:
-        logger.warning(f"Error checking URL content: {e}")
-        return True
+        logger.error(f"Error checking URL content: {e}")
+        return False
 
 
 async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
@@ -128,11 +131,13 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                         logger.warning(f"Picker item {index + 1} has empty content")
                         continue
 
-                    input_file = URLInputFile(item.url)
+                    input_file = URLInputFile(await fix_url(item.url, response.status))
                     thumbnail = None
                     if item.thumb and thumb_has_content:
                         try:
-                            thumbnail = URLInputFile(item.thumb)
+                            thumbnail = URLInputFile(
+                                await fix_url(item.thumb, response.status)
+                            )
                         except Exception as thumb_error:
                             logger.warning(f"Failed to create thumbnail: {thumb_error}")
 
@@ -178,7 +183,7 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                         return result
 
                     input_file = URLInputFile(
-                        response.audio,
+                        await fix_url(response.audio, response.status),
                         filename=response.audioFilename or "audio.mp3",
                     )
                     media = InputMediaAudio(media=input_file)
@@ -196,7 +201,10 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
                             return result
 
                     filename = response.filename or "file"
-                    input_file = URLInputFile(response.url, filename=filename)
+                    input_file = URLInputFile(
+                        await fix_url(response.url, response.status),
+                        filename=filename,
+                    )
 
                     if response.type == "video":
                         logger.info("Creating video object based on type")
@@ -225,6 +233,7 @@ async def parse_media_response(response: MediaResponse) -> ParsedMediaResponse:
 
             except Exception as url_error:
                 logger.error(f"Error creating media from URL: {url_error}")
+                traceback.print_exc()
                 result.error_count = 1
                 result.success = False
                 result.error_message = "Failed to process media URL"
@@ -246,11 +255,10 @@ class MediaFetcher:
 
     def __init__(self):
         self.apis = [
+            "https://cobalt-7.kwiatekmiki.com/api/json",
             "https://cobalt.255x.ru",
             "https://co.eepy.today",
-            "https://cobalt-7.kwiatekmiki.com/api/json",
             "https://co.otomir23.me",
-            "https://cobalt-api.kwiatekmiki.com",
         ]
         self.headers = {
             "Content-Type": "application/json",
@@ -269,39 +277,46 @@ class MediaFetcher:
         Returns:
             MediaResponse object or None if all APIs fail
         """
+
         payload = {
             "url": url,
             "audioBitrate": "320",
             "tiktokFullAudio": True,
             "disableMetadata": False,
             "filenameStyle": "nerdy",
+            "alwaysProxy": True,
         }
 
         error_text = None
         if audio:
             payload["downloadMode"] = "audio"
 
-        for api in self.apis:
-            try:
-                logger.info(f"Trying to fetch from {api}")
-                response = requests.post(
-                    f"{api}", headers=self.headers, json=payload, timeout=5
-                )
+        for x in range(2):
+            for api in self.apis:
+                try:
+                    logger.info(f"Trying to fetch from {api}")
+                    response = requests.post(
+                        f"{api}", headers=self.headers, json=payload, timeout=5
+                    )
 
-                if response.status_code == 200:
-                    data = response.json()
-                    return MediaResponse.model_validate(data)
+                    if response.status_code == 200:
+                        data = response.json()
+                        return MediaResponse.model_validate(data)
 
-                logger.warning(
-                    f"Failed to fetch from {api}: Status code {response.status_code} {response.text}"
-                )
-                error_text = response.json().get(
-                    "error", {"code": "unknown", "message": "Unknown error"}
-                )
+                    logger.warning(
+                        f"Failed to fetch from {api}: Status code {response.status_code} {response.text}"
+                    )
+                    try:
+                        error_text = response.json().get(
+                            "error", {"code": "unknown", "message": "Unknown error"}
+                        )
+                    except Exception:
+                        pass
 
-            except Exception as e:
-                traceback.print_exc()
-                logger.error(f"Error fetching from {api}: {str(e)}")
+                except Exception as e:
+                    traceback.print_exc()
+                    logger.error(f"Error fetching from {api}: {str(e)}")
 
-        logger.error("All APIs failed")
+            logger.error("All APIs failed")
+
         return MediaResponse(status="error", error=error_text)

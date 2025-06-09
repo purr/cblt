@@ -1,8 +1,8 @@
-import os
 import asyncio
+import os
 
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
+from dotenv import load_dotenv
 
 from bot import BotHandler
 from logger import logger

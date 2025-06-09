@@ -61,6 +61,23 @@ async def get_unopened_dms_keyboard(uuid: str, url: str, bot_username: str):
     )
 
 
+async def get_error_keyboard(url: str):
+    """Function to create keyboard for the permission required scenario
+
+    If uuid is provided, adds Try Again buttons that will simulate real callbacks
+    """
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                text="⚠️ Error, could not download", callback_data="error"
+            )
+        ],
+        [await query_btn(url)],
+    ]
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
 async def get_permission_required_keyboard(
     url: str, bot_username: str, uuid: str = None
 ):

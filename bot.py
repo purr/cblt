@@ -11,6 +11,7 @@ from aiogram.types import InlineQueryResultCachedPhoto, InputMedia
 
 from keyboards import (
     get_download_keyboard,
+    get_error_keyboard,
     get_open_bot_keyboard,
     get_permission_required_keyboard,
     get_processing_keyboard,
@@ -135,6 +136,7 @@ class BotHandler:
             if len(callback_data) < 3:
                 return await callback.answer("Invalid callback data")
 
+            await callback.answer("ฅ^>⩊<^ ฅ")
             download_uuid = callback_data[1]
             download_type = callback_data[2]
 
@@ -152,7 +154,6 @@ class BotHandler:
 
         except Exception as e:
             logger.error(f"Error processing callback: {e}")
-            await callback.answer("Unexpected error!")
 
     async def cmd_start(self, message: types.Message, command: Command, bot: Bot):
         """Command handler for /start"""
@@ -328,7 +329,7 @@ class BotHandler:
                 e
             ) or "bot can't initiate conversation" in str(e):
                 logger.warning(f"User {user_id} has not started the bot or blocked it")
-                return False, None
+                return False, True
 
             return False, None
 
@@ -343,7 +344,7 @@ class BotHandler:
         """Callback query handler for both inline queries and direct messages"""
 
         if download_uuid not in self.query_info:
-            return await callback.answer("𖦹 Expired, do a new query :( ₊✧⋆⭒˚｡⋆")
+            return await callback.answer("𖦹 Expired, do a new query ₊✧⋆⭒˚｡⋆")
 
         user = callback.from_user
         from_user_id = self.query_info[download_uuid].from_user_id
@@ -474,24 +475,38 @@ class BotHandler:
 
                 # If we couldn't send the DM (perhaps user hasn't started the bot)
                 if not dm_sent:
-                    if is_inline:
-                        # For inline messages, show a permission required message
-                        await bot.edit_message_reply_markup(
-                            inline_message_id=callback.inline_message_id,
-                            reply_markup=await get_permission_required_keyboard(
-                                url, self.bot_username, download_uuid
-                            ),
-                        )
+                    if first_file_id:
+                        if is_inline:
+                            # For inline messages, show a permission required message
+                            await bot.edit_message_reply_markup(
+                                inline_message_id=callback.inline_message_id,
+                                reply_markup=await get_permission_required_keyboard(
+                                    url, self.bot_username, download_uuid
+                                ),
+                            )
+                        else:
+                            # For direct messages, show a permission required message
+                            await bot.edit_message_reply_markup(
+                                chat_id=callback.message.chat.id,
+                                message_id=callback.message.message_id,
+                                reply_markup=await get_permission_required_keyboard(
+                                    url, self.bot_username, download_uuid
+                                ),
+                            )
+                        return True
                     else:
-                        # For direct messages, show a permission required message
-                        await bot.edit_message_reply_markup(
-                            chat_id=callback.message.chat.id,
-                            message_id=callback.message.message_id,
-                            reply_markup=await get_permission_required_keyboard(
-                                url, self.bot_username, download_uuid
-                            ),
-                        )
-                    return True
+                        if is_inline:
+                            await bot.edit_message_reply_markup(
+                                inline_message_id=callback.inline_message_id,
+                                reply_markup=await get_error_keyboard(url),
+                            )
+                        else:
+                            await bot.edit_message_reply_markup(
+                                chat_id=callback.message.chat.id,
+                                message_id=callback.message.message_id,
+                                reply_markup=await get_error_keyboard(url),
+                            )
+                        return True
 
                 # Number of media files for the success message
                 media_count = result.success_count
@@ -525,17 +540,15 @@ class BotHandler:
                     "An error occurred while processing your request. Please try again."
                 )
                 if is_inline:
-                    await bot.edit_message_text(
+                    await bot.edit_message_reply_markup(
                         inline_message_id=callback.inline_message_id,
-                        text=error_message,
-                        reply_markup=query_keyboard,
+                        reply_markup=await get_error_keyboard(url),
                     )
                 else:
-                    await bot.edit_message_caption(
+                    await bot.edit_message_reply_markup(
                         chat_id=callback.message.chat.id,
                         message_id=callback.message.message_id,
-                        caption=error_message,
-                        reply_markup=query_keyboard,
+                        reply_markup=await get_error_keyboard(url),
                     )
             except Exception as fallback_error:
                 logger.error(f"Failed to send fallback message: {fallback_error}")
@@ -550,7 +563,6 @@ class BotHandler:
 
         finally:
             if not automatic_download:
-                await callback.answer()
                 logger.info(f"Callback processed: {download_type} by user {user.id}")
 
     async def update_original_message(
@@ -729,8 +741,8 @@ class BotHandler:
             results=[photo],
             cache_time=1,
             is_personal=True,
-            switch_pm_text="Open bot settings",
-            switch_pm_parameter="settings",
+            # switch_pm_text="Open bot settings",
+            # switch_pm_parameter="settings",
         )
 
     async def process_chosen_inline_result(

@@ -114,17 +114,20 @@ async def get_permission_required_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-async def get_open_bot_keyboard(bot_username: str):
-    """Create keyboard with an 'Open Bot' button"""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔍 Open Bot", url=f"https://t.me/{bot_username}"
-                )
-            ]
-        ]
-    )
+async def get_open_bot_keyboard(bot_username: str, url: str = None):
+    """Create keyboard with an 'Open Bot' button
+
+    If url is provided, also includes a query link button
+    """
+    keyboard = [
+        [InlineKeyboardButton(text="🔍 Open Bot", url=f"https://t.me/{bot_username}")]
+    ]
+
+    # Add query link button if URL is provided
+    if url:
+        keyboard.append([await query_btn(url)])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 async def get_processing_keyboard(url: str):

@@ -232,6 +232,7 @@ class BotHandler:
         result: Union[List[InputMedia], InputMedia],
         bot: Bot,
         keyboard=None,
+        url: str = None,
     ) -> Tuple[bool, Union[str, None]]:
         """Send media files to the user's DM
 
@@ -240,6 +241,7 @@ class BotHandler:
             result: The media result(s) to send
             bot: The bot instance
             keyboard: Optional keyboard to attach to media
+            url: Optional URL to add as a query link for multiple media
 
         Returns:
             Tuple[bool, Union[str, None]]: (Success status, First media file_id if available)
@@ -254,14 +256,25 @@ class BotHandler:
             if len(media_list) > 1:
                 # Send media group (multiple files)
                 chunks_sent = 0
+
+                # Send media group (we can't add keyboards to media groups directly)
                 for i in range(0, len(media_list), 10):
                     chunk = media_list[i : i + 10]
-                    # We can't add keyboards to media groups directly
                     sent_media = await bot.send_media_group(
                         chat_id=user_id,
                         media=chunk,
                         disable_notification=True,  # Disable notifications
                     )
+
+                    # For multi-media, send an additional message with the link button
+                    if i == 0 and url:
+                        await bot.send_message(
+                            chat_id=user_id,
+                            text="Media source link:",
+                            reply_markup=await get_query_keyboard(url),
+                            disable_notification=True,
+                        )
+
                     chunks_sent += 1
 
                     if i == 0 and sent_media and len(sent_media) > 0:
@@ -352,7 +365,7 @@ class BotHandler:
         is_inline = self.query_info[download_uuid].inline
 
         query_keyboard = await get_query_keyboard(url)
-        open_bot_keyboard = await get_open_bot_keyboard(self.bot_username)
+        open_bot_keyboard = await get_open_bot_keyboard(self.bot_username, url)
 
         if callback.from_user.id != from_user_id:
             return await callback.answer("𖦹 This is not your message ₊✧⋆⭒˚｡⋆")
@@ -470,7 +483,7 @@ class BotHandler:
                 # Send media to DM regardless of whether it's inline or not
                 # Pass the query keyboard to attach it to the media in DMs
                 dm_sent, first_file_id = await self.send_media_to_dm(
-                    user.id, media_list, bot, query_keyboard
+                    user.id, media_list, bot, query_keyboard, url
                 )
 
                 # If we couldn't send the DM (perhaps user hasn't started the bot)
